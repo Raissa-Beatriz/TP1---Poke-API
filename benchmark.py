@@ -1,81 +1,141 @@
-import requests, os, time, threading, csv
+import csv
+import os
+import time
+import threading
 from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-os.makedirs("images", exist_ok=True)
+import requests
+
+BASE_URL = "https://pokeapi.co/api/v2/pokemon/{}"
+IMAGE_DIR = Path("images")
+RESULTS_FILE = "results.csv"
+TOTALS = [100, 500, 1000]
+WORKERS = [2, 4, 8]
+RUNS = 10
+
+
+def ensure_dirs():
+    IMAGE_DIR.mkdir(exist_ok=True)
+
+
+def clear_images():
+    if not IMAGE_DIR.exists():
+        return
+    for f in IMAGE_DIR.glob("*.png"):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            time.sleep(0.1)
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
 
 def get_and_save(pokemon_id):
     try:
-        data = requests.get(f"https://pokeapi.co/api/v2/pokemon/{pokemon_id}", timeout=10).json()
+        r = requests.get(BASE_URL.format(pokemon_id), timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
         img_url = data["sprites"]["front_default"]
-        if img_url:
-            img = requests.get(img_url, timeout=10).content
-            with open(f"images/{pokemon_id}.png", "wb") as f:
-                f.write(img)
+        if not img_url:
+            return
+
+        img = requests.get(img_url, timeout=15)
+        img.raise_for_status()
+
+        with open(IMAGE_DIR / f"{pokemon_id}.png", "wb") as f:
+            f.write(img.content)
+
     except Exception as e:
         print(f"Erro no pokémon {pokemon_id}: {e}")
 
-def clear():
-    for f in os.listdir("images"):
-        os.remove(f"images/{f}")
 
-def measure(fn, runs=10):
+def sequential(ids):
+    for pokemon_id in ids:
+        get_and_save(pokemon_id)
+
+
+def run_threading(ids, workers):
+    threads = []
+    for pokemon_id in ids:
+        t = threading.Thread(target=get_and_save, args=(pokemon_id,))
+        threads.append(t)
+        t.start()
+
+        if len(threads) >= workers:
+            for th in threads:
+                th.join()
+            threads = []
+
+    for th in threads:
+        th.join()
+
+
+def run_multiprocessing(ids, workers):
+    with Pool(processes=workers) as pool:
+        pool.map(get_and_save, ids)
+
+
+def run_futures(ids, workers):
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(get_and_save, ids))
+
+
+def measure(fn, runs=RUNS):
     times = []
     for _ in range(runs):
-        clear()
-        start = time.time()
+        clear_images()
+        start = time.perf_counter()
         fn()
-        times.append(time.time() - start)
+        times.append(time.perf_counter() - start)
     return round(sum(times) / len(times), 2)
 
-TOTALS = [100, 500, 1000]
-WORKERS = [2, 4, 8]
-results = []
 
-for total in TOTALS:
-    ids = range(1, total + 1)
-    print(f"\n=== {total} pokémons ===")
+def main():
+    ensure_dirs()
+    results = []
 
-    avg = measure(lambda: [get_and_save(i) for i in ids])
-    results.append({"abordagem": "Sequential", "workers": "-", "total": total, "media_s": avg})
-    print(f"  Sequential: {avg}s")
+    for total in TOTALS:
+        ids = list(range(1, total + 1))
+        print(f"\n=== {total} pokémons ===")
 
-    for w in WORKERS:
-        def run_t(ids=ids, w=w):
-            threads = []
-            for i in ids:
-                t = threading.Thread(target=get_and_save, args=(i,))
-                threads.append(t); t.start()
-                if len(threads) >= w:
-                    for th in threads: th.join()
-                    threads = []
-            for th in threads: th.join()
-        avg = measure(run_t)
-        results.append({"abordagem": "Threading", "workers": w, "total": total, "media_s": avg})
-        print(f"  Threading-{w}: {avg}s")
+        avg = measure(lambda: sequential(ids))
+        results.append({"abordagem": "Sequential", "workers": "-", "total": total, "media_s": avg})
+        print(f"  Sequential: {avg}s")
 
-    for w in WORKERS:
-        def run_mp(ids=ids, w=w):
-            with Pool(processes=w) as pool: pool.map(get_and_save, ids)
-        avg = measure(run_mp)
-        results.append({"abordagem": "Multiprocessing", "workers": w, "total": total, "media_s": avg})
-        print(f"  Multiprocessing-{w}: {avg}s")
+        for w in WORKERS:
+            avg = measure(lambda w=w: run_threading(ids, w))
+            results.append({"abordagem": "Threading", "workers": w, "total": total, "media_s": avg})
+            print(f"  Threading-{w}: {avg}s")
 
-    for w in WORKERS:
-        def run_f(ids=ids, w=w):
-            with ThreadPoolExecutor(max_workers=w) as ex: ex.map(get_and_save, ids)
-        avg = measure(run_f)
-        results.append({"abordagem": "concurrent.futures", "workers": w, "total": total, "media_s": avg})
-        print(f"  Futures-{w}: {avg}s")
+        for w in WORKERS:
+            avg = measure(lambda w=w: run_multiprocessing(ids, w))
+            results.append({"abordagem": "Multiprocessing", "workers": w, "total": total, "media_s": avg})
+            print(f"  Multiprocessing-{w}: {avg}s")
 
-with open("results.csv", "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=["abordagem","workers","total","media_s"])
-    writer.writeheader()
-    writer.writerows(results)
+        for w in WORKERS:
+            avg = measure(lambda w=w: run_futures(ids, w))
+            results.append({"abordagem": "concurrent.futures", "workers": w, "total": total, "media_s": avg})
+            print(f"  Futures-{w}: {avg}s")
 
-print("\n\n=== RESULTADO FINAL ===")
-print(f"{'Abordagem':<22} {'Workers':<10} {'Total':<8} {'Média (s)'}")
-print("-"*55)
-for r in results:
-    print(f"{r['abordagem']:<22} {str(r['workers']):<10} {r['total']:<8} {r['media_s']}")
-print("\nSalvo em results.csv")
+    with open(RESULTS_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["abordagem", "workers", "total", "media_s"])
+        writer.writeheader()
+        writer.writerows(results)
+
+    print("\n\n=== RESULTADO FINAL ===")
+    print(f"{'Abordagem':<22} {'Workers':<10} {'Total':<8} {'Média (s)'}")
+    print("-" * 55)
+    for r in results:
+        print(f"{r['abordagem']:<22} {str(r['workers']):<10} {r['total']:<8} {r['media_s']}")
+    print(f"\nSalvo em {RESULTS_FILE}")
+
+
+if __name__ == "__main__":
+    main()
