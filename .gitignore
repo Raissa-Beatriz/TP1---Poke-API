@@ -4,4 +4,3 @@ images/*
 __pycache__/
 .env
 venv/
-results.csv
